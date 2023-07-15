@@ -1,41 +1,22 @@
 import { kv } from '@vercel/kv'
-import { OpenAIStream, StreamingTextResponse } from 'ai'
-import { Configuration, OpenAIApi } from 'openai-edge'
 
 import { auth } from '@/auth'
 import { nanoid } from '@/lib/utils'
 
-export const runtime = 'edge'
+import { PrismaVectorStore } from "langchain/vectorstores/prisma";
+import { PrismaClient, Prisma, Document } from "@prisma/client";
+import { OpenAIEmbeddings } from "langchain/embeddings/openai";
+import { ChatOpenAI } from "langchain/chat_models/openai";
+import { ConversationalRetrievalQAChain } from 'langchain/chains'
+import { LangChainStream, StreamingTextResponse, Message } from "ai";
+import { BufferMemory } from "langchain/memory";
 
-const configuration = new Configuration({
-  apiKey: process.env.OPENAI_API_KEY
-})
-
-const openai = new OpenAIApi(configuration)
+// export const runtime = 'edge'
 
 export async function POST(req: Request) {
   const json = await req.json()
   const { messages, previewToken } = json
-  const userId = (await auth())?.user.id
-
-  if (!userId) {
-    return new Response('Unauthorized', {
-      status: 401
-    })
-  }
-
-  if (previewToken) {
-    configuration.apiKey = previewToken
-  }
-
-  const res = await openai.createChatCompletion({
-    model: 'gpt-3.5-turbo',
-    messages,
-    temperature: 0.7,
-    stream: true
-  })
-
-  const stream = OpenAIStream(res, {
+  const { stream, handlers } = LangChainStream({
     async onCompletion(completion) {
       const title = json.messages[0].content.substring(0, 100)
       const id = json.id ?? nanoid()
@@ -62,6 +43,57 @@ export async function POST(req: Request) {
       })
     }
   })
+
+  const userId = (await auth())?.user.id
+
+  if (!userId) {
+    return new Response('Unauthorized', {
+      status: 401
+    })
+  }
+
+  const db = new PrismaClient();
+
+  const vectorStore = PrismaVectorStore.withModel<Document>(db).create(
+    new OpenAIEmbeddings(),
+    {
+      prisma: Prisma,
+      tableName: "Document",
+      vectorColumnName: "vector",
+      columns: {
+        id: PrismaVectorStore.IdColumn,
+        content: PrismaVectorStore.ContentColumn,
+      },
+    }
+  );
+
+  const model = new ChatOpenAI({
+    modelName: "gpt-3.5-turbo",
+    temperature: 0.7,
+    streaming: true,
+  })
+
+  const query = (messages as Message[]).map(m =>
+    m.role == 'user'
+      ? m.content
+      : ""
+  )?.at(-1);
+
+  const chain = ConversationalRetrievalQAChain.fromLLM(
+    model,
+    vectorStore.asRetriever(),
+    {
+      memory: new BufferMemory({
+        memoryKey: "chat_history",
+      }),
+    }
+  );
+
+  chain
+    .call({ question: query },
+      [handlers]
+    )
+    .catch(console.error)
 
   return new StreamingTextResponse(stream)
 }
